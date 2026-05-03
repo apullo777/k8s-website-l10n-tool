@@ -83,15 +83,17 @@ _ORPHAN_REASON = (
     "upstream or is intentionally locale-specific."
 )
 
-STATUS_HIGHLY_OUTDATED = "Outdated"
+STATUS_OUTDATED = "Outdated"
 STATUS_POSSIBLY_OUTDATED = "Possibly outdated"
 STATUS_CURRENT = "Up to date"
 
-_STRONG_H2_THRESHOLD = 2
-_STRONG_H3_WITH_H2_THRESHOLD = 5
-_STRONG_CODE_THRESHOLD = 3
-_STRONG_ANCHOR_THRESHOLD = 5
-_STRONG_VERSION_THRESHOLD = 3
+# Cutoffs for when missing items count as a "strong" outdatedness signal;
+# see classify_status() for how strong signals affect the final status.
+_STRONG_H2_THRESHOLD = 2              # missing H2 headings
+_STRONG_H3_WITH_H2_THRESHOLD = 5      # missing H3s, plus at least one missing H2
+_STRONG_CODE_THRESHOLD = 3            # missing code blocks
+_STRONG_ANCHOR_THRESHOLD = 5          # missing section anchors
+_STRONG_VERSION_THRESHOLD = 3         # missing newer Kubernetes version refs
 
 _STRONG_INDICATORS: FrozenSet[str] = frozenset({
     "empty_stub", "severe_heading_loss", "severe_code_loss",
@@ -120,7 +122,7 @@ _NON_LENGTH_INDICATORS: FrozenSet[str] = frozenset({
 })
 
 _STATUS_SORT_KEY = {
-    STATUS_HIGHLY_OUTDATED: 0,
+    STATUS_OUTDATED: 0,
     STATUS_POSSIBLY_OUTDATED: 1,
     STATUS_CURRENT: 2,
 }
@@ -355,7 +357,20 @@ def _should_ignore_length_gap(
             return True
     return False
 
-# --- Locale-specific adjustments ---
+# --- Locale-specific false-alarm guards ---
+#
+# These helpers suppress or downgrade indicators that have empirically produced
+# false alarms for specific locale/content patterns. Keeping them together makes
+# it easier to review where locale-specific behavior affects triage.
+#
+# Examples:
+# - CJK translations can use fewer/denser lines than EN without being outdated.
+# - Some Latin-script translations preserve full body content in fewer lines.
+# - zh-cn pages may render source H2 headings as H3.
+# - Some locales translate section anchors instead of preserving EN anchor IDs.
+#
+# `_should_ignore_length_gap` above handles length-gap false alarms before
+# indicators are emitted; the helpers below handle later heading/anchor guards.
 
 def _resolve_effective_heading_loss(
     stats: FileStats, en: ParsedFile, l10n: ParsedFile, locale: str,
@@ -398,6 +413,13 @@ def _is_expected_anchor_loss_by_locale(
 
 # --- Indicator detection ---
 
+def _has_length_gap_support(stats: FileStats, eff_h2: int) -> bool:
+    """Return whether non-length indicators support a length-gap finding."""
+    return (
+        eff_h2 > 0 or stats.missing_h3 > 0
+        or stats.missing_code_blocks > 0 or stats.missing_new_versions > 0
+    )
+
 def build_indicators(
     stats: FileStats, en: ParsedFile, l10n: ParsedFile, locale: str,
 ) -> List[str]:
@@ -414,10 +436,7 @@ def build_indicators(
 
     eff_h2, _ = _resolve_effective_heading_loss(stats, en, l10n, locale)
 
-    has_support = (
-        eff_h2 > 0 or stats.missing_h3 > 0
-        or stats.missing_code_blocks > 0 or stats.missing_new_versions > 0
-    )
+    has_support = _has_length_gap_support(stats, eff_h2)
 
     if _should_ignore_length_gap(stats, en, l10n, locale, level, has_support):
         level = _LENGTH_GAP_NONE
@@ -486,21 +505,21 @@ def classify_status(
     supporting = indset & _SUPPORTING_INDICATORS
 
     if "empty_stub" in indset:
-        return STATUS_HIGHLY_OUTDATED
+        return STATUS_OUTDATED
     if "severe_api_and_feature_mismatch" in indset:
-        return STATUS_HIGHLY_OUTDATED
+        return STATUS_OUTDATED
     if len(strong) >= 2:
-        return STATUS_HIGHLY_OUTDATED
+        return STATUS_OUTDATED
     if strong and supporting:
-        return STATUS_HIGHLY_OUTDATED
+        return STATUS_OUTDATED
     if "large_length_gap" in indset:
         non_length_gap = supporting - _LENGTH_GAP_INDICATORS
         if non_length_gap and not _is_expected_anchor_loss_by_locale(
                 non_length_gap, locale,
                 l10n_to_en_body_word_ratio, missing_anchors):
-            return STATUS_HIGHLY_OUTDATED
+            return STATUS_OUTDATED
     if len(supporting) >= 3:
-        return STATUS_HIGHLY_OUTDATED
+        return STATUS_OUTDATED
     if strong or supporting:
         return STATUS_POSSIBLY_OUTDATED
     if "small_length_gap" in indset:
@@ -696,10 +715,26 @@ def count_files_by_status(
 ) -> Tuple[int, int, int]:
     c = Counter(fr.status for fr in evaluated)
     return (
-        c[STATUS_HIGHLY_OUTDATED],
+        c[STATUS_OUTDATED],
         c[STATUS_POSSIBLY_OUTDATED],
         c[STATUS_CURRENT],
     )
+
+def _build_report_disclaimer() -> List[str]:
+    """Triage disclaimer + status-meaning block included in every per-locale report."""
+    return [
+        "> This report is a signal-based triage aid, not a final localization review.",
+        "> Please verify flagged files manually. `Up to date` means only that no",
+        "> issue was found by these checks; it does not prove the translation is current.",
+        "",
+        "**Triage category meanings:**",
+        "",
+        "- `Orphan`: no matching English source; verify whether this is expected.",
+        "- `Outdated`: high-confidence signal; likely needs manual review.",
+        "- `Possibly outdated`: medium-confidence signal; verify manually.",
+        "- `Up to date`: no signal found; lowest priority, not proof of correctness.",
+        "",
+    ]
 
 def build_locale_report(
     locale: str,
@@ -714,24 +749,27 @@ def build_locale_report(
 ) -> str:
     hi, poss, curr = count_files_by_status(evaluated)
     total = len(evaluated) + len(orphans)
-    w = max(len(STATUS_HIGHLY_OUTDATED), len(STATUS_POSSIBLY_OUTDATED),
+    w = max(len(STATUS_OUTDATED), len(STATUS_POSSIBLY_OUTDATED),
             len(STATUS_CURRENT), len("Evaluated"), len("Orphan"))
     lines: List[str] = [
-        f"## Localization status: `{locale}`",
+        f"## Localization triage: `{locale}`",
         "",
         f"Generated: {date}  ",
         "Method: content-based indicators only  ",
         "Script: `l10n-outdatedness-triage.py`",
         "",
-        "| Status | Count |",
+    ]
+    lines.extend(_build_report_disclaimer())
+    lines.extend([
+        "| Triage category | Count |",
         "|---|---:|",
         f"| {'Evaluated':<{w}} | {total} |",
         f"| {STATUS_CURRENT:<{w}} | {curr} |",
         f"| {'Orphan':<{w}} | {len(orphans)} |",
-        f"| {STATUS_HIGHLY_OUTDATED:<{w}} | {hi} |",
+        f"| {STATUS_OUTDATED:<{w}} | {hi} |",
         f"| {STATUS_POSSIBLY_OUTDATED:<{w}} | {poss} |",
         "",
-    ]
+    ])
 
     area_counts: Counter = Counter(
         _extract_doc_area(fr.localized_path, locale)
@@ -745,7 +783,7 @@ def build_locale_report(
         lines.append("")
 
     by_status: Dict[str, List[FileReport]] = {
-        STATUS_HIGHLY_OUTDATED: [],
+        STATUS_OUTDATED: [],
         STATUS_POSSIBLY_OUTDATED: [],
         STATUS_CURRENT: [],
     }
@@ -767,7 +805,7 @@ def build_locale_report(
     else:
         lines.extend(["_None_", ""])
 
-    for key in (STATUS_HIGHLY_OUTDATED, STATUS_POSSIBLY_OUTDATED):
+    for key in (STATUS_OUTDATED, STATUS_POSSIBLY_OUTDATED):
         items = by_status[key]
         lines.extend([f"### {key} ({len(items)})", ""])
         if not items:
@@ -780,7 +818,7 @@ def build_locale_report(
                 if link_mode else ""
             )
             if detailed and fr.reasons:
-                lines.append(f"**`{path}`** — status: {fr.status}{links}")
+                lines.append(f"**`{path}`** — triage: {fr.status}{links}")
                 lines.extend(f"- {r}" for r in fr.reasons)
                 if fr.indicators:
                     lines.append(f"- Indicators: {', '.join(fr.indicators)}")
@@ -797,11 +835,11 @@ def build_index_report(
     results: List[Tuple[str, List[FileReport], List[str]]], date: str,
 ) -> str:
     lines = [
-        "## Localization status index",
+        "## Localization triage index",
         "",
         f"Generated: {date}",
         "",
-        f"| Locale | Report | Evaluated | {STATUS_CURRENT} | Orphan | {STATUS_HIGHLY_OUTDATED} | {STATUS_POSSIBLY_OUTDATED} |",
+        f"| Locale | Report | Evaluated | {STATUS_CURRENT} | Orphan | {STATUS_OUTDATED} | {STATUS_POSSIBLY_OUTDATED} |",
         "|---|---|---:|---:|---:|---:|---:|",
     ]
     for locale, evaluated, orphans in results:
@@ -922,7 +960,7 @@ def main() -> None:
         hi, poss, curr = count_files_by_status(evaluated)
         print(
             f"Wrote {out_path}  "
-            f"({len(orphans)} orphans, {hi} {STATUS_HIGHLY_OUTDATED}, "
+            f"({len(orphans)} orphans, {hi} {STATUS_OUTDATED}, "
             f"{poss} {STATUS_POSSIBLY_OUTDATED}, {curr} {STATUS_CURRENT})",
             file=sys.stderr,
         )
