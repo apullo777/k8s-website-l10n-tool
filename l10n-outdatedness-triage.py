@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
-"""Localization outdatedness detector.
 
-Compares each localized Markdown page against its English source using
-content-based indicators (length gap, missing headings/code/anchors,
-version mismatch, API/feature-state token mismatch) and classifies it as
-`Outdated`, `Possibly outdated`, or `Up to date`.
+"""Localization outdatedness triage helper.
+
+Compares each localized Markdown page against its English source and
+classifies it as `Likely outdated`, `Maybe outdated`, or `No signal`.
 
 Usage:
-    # all locales (default)
+    # scan all non-en locales (default)
     python3 scripts/l10n-outdatedness-triage.py
-    # specific locales
-    python3 scripts/l10n-outdatedness-triage.py --lang ko
+    
+    # scan specific locales
     python3 scripts/l10n-outdatedness-triage.py --lang ko ja zh-cn
+    
+    # add GitHub links + per-file indicator detail
+    python3 scripts/l10n-outdatedness-triage.py --lang ko --link web --verbose
 
-    # Report generation options
-    python3 scripts/l10n-outdatedness-triage.py --lang ko --output-dir /tmp/l10n
-    python3 scripts/l10n-outdatedness-triage.py --lang ko --verbose
-    python3 scripts/l10n-outdatedness-triage.py --lang ko --link web
-    python3 scripts/l10n-outdatedness-triage.py --lang ko --link local
-
-    # Select kubernetes/website repository root (default: parent directory):
-    python3 l10n-outdatedness-triage.py --repo-root ../website
+    # Run with `--help` for the full option list.
+    python3 scripts/l10n-outdatedness-triage.py --help
 """
 
 import argparse

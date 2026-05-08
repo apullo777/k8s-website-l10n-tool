@@ -699,6 +699,7 @@ def format_index_md(results: List[Tuple[str, List[FileScore]]], date: str) -> st
     return "\n".join(lines)
 
 def main() -> None:
+    # Setup: parse CLI args and resolve runtime configuration.
     parser = argparse.ArgumentParser(
         description=(
             "File-level localization outdatedness detector for Kubernetes docs.\n"
@@ -773,6 +774,8 @@ def main() -> None:
         )
 
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Per-locale phase: scan content/<locale>/ and emit one report file each.
     all_results: List[Tuple[str, List[FileScore]]] = []
 
     for language in languages:
@@ -790,7 +793,8 @@ def main() -> None:
             f"({high} high, {medium} medium, {low} low, {utd} up-to-date)",
             file=sys.stderr,
         )
-
+        
+    # Cross-locale phase: write a roll-up index only when >1 locale was scanned.
     if len(languages) > 1:
         index_path = os.path.join(args.output_dir, "l10n-outdated-report-index.md")
         with open(index_path, "w", encoding="utf-8") as fh:
