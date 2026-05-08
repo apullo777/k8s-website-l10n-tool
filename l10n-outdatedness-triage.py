@@ -380,35 +380,10 @@ def _should_ignore_length_gap(
 # Examples:
 # - CJK translations can use fewer/denser lines than EN without being outdated.
 # - Some Latin-script translations preserve full body content in fewer lines.
-# - zh-cn pages may render source H2 headings as H3.
 # - Some locales translate section anchors instead of preserving EN anchor IDs.
 #
 # `_should_ignore_length_gap` above handles length-gap false alarms before
-# indicators are emitted; the helpers below handle later heading/anchor adjustments.
-
-def _resolve_effective_heading_loss(
-    stats: FileStats, en: ParsedFile, l10n: ParsedFile, locale: str,
-) -> Tuple[int, str]:
-    """Missing H2 count after locale-specific adjustments."""
-    # zh-cn bilingual files sometimes render source H2 as H3 (source heading
-    # kept in a comment). When H3 surplus covers the H2 deficit, count as 1
-    # missing H2; predicates guard against genuine small H2 deficits.
-    if (locale == "zh-cn"
-            and stats.missing_h2 >= 3
-            and l10n.h3 > en.h3
-            and (l10n.h3 - en.h3) >= stats.missing_h2
-            and stats.l10n_to_en_line_ratio >= 0.70
-            and stats.missing_code_blocks <= 1):
-        effective = min(1, stats.missing_h2)
-        adjusted = stats.missing_h2 - effective
-        note = (
-            f"Possible heading-level mismatch: {adjusted} of {stats.missing_h2} "
-            f"apparent missing H2(s) may have been translated as H3(s) in the "
-            f"zh-cn file (zh-cn has {l10n.h3 - en.h3} more H3s than source) — "
-            "counted as 1 H2; verify manually"
-        )
-        return effective, note
-    return stats.missing_h2, ""
+# indicators are emitted; the helper below handles later anchor adjustments.
 
 def _is_expected_anchor_loss_by_locale(
     non_length_gap_supporting: Set[str], locale: str,
@@ -427,10 +402,10 @@ def _is_expected_anchor_loss_by_locale(
 
 # --- Indicator detection ---
 
-def _has_length_gap_support(stats: FileStats, eff_h2: int) -> bool:
+def _has_length_gap_support(stats: FileStats) -> bool:
     """Return whether non-length indicators support a length-gap finding."""
     return (
-        eff_h2 > 0 or stats.missing_h3 > 0
+        stats.missing_h2 > 0 or stats.missing_h3 > 0
         or stats.missing_code_blocks > 0 or stats.missing_new_versions > 0
     )
 
@@ -448,9 +423,7 @@ def build_indicators(
     else:
         level = _LENGTH_GAP_NONE
 
-    eff_h2, _ = _resolve_effective_heading_loss(stats, en, l10n, locale)
-
-    has_support = _has_length_gap_support(stats, eff_h2)
+    has_support = _has_length_gap_support(stats)
 
     if _should_ignore_length_gap(stats, en, l10n, locale, level, has_support):
         level = _LENGTH_GAP_NONE
@@ -460,10 +433,10 @@ def build_indicators(
     elif level == _LENGTH_GAP_MODERATE:
         indicators.append("moderate_length_gap")
 
-    if (eff_h2 >= _STRONG_H2_THRESHOLD
-            or (eff_h2 >= 1 and stats.missing_h3 >= _STRONG_H3_WITH_H2_THRESHOLD)):
+    if (stats.missing_h2 >= _STRONG_H2_THRESHOLD
+            or (stats.missing_h2 >= 1 and stats.missing_h3 >= _STRONG_H3_WITH_H2_THRESHOLD)):
         indicators.append("severe_heading_loss")
-    elif eff_h2 >= 1 or stats.missing_h3 >= 2:
+    elif stats.missing_h2 >= 1 or stats.missing_h3 >= 2:
         indicators.append("moderate_heading_loss")
 
     if stats.missing_code_blocks >= _STRONG_CODE_THRESHOLD:
@@ -563,19 +536,15 @@ def build_reasons(
     elif "small_length_gap" in indset:
         reasons.append(_build_length_gap_reason(_LENGTH_GAP_SMALL, stats.l10n_to_en_line_ratio))
 
-    eff_h2, h2_as_h3_note = _resolve_effective_heading_loss(stats, en, l10n, locale)
-    if eff_h2 > 0 or stats.missing_h3 > 0:
+    if stats.missing_h2 > 0 or stats.missing_h3 > 0:
         parts = []
-        if eff_h2:
-            parts.append(f"{eff_h2} H2")
+        if stats.missing_h2:
+            parts.append(f"{stats.missing_h2} H2")
         if stats.missing_h3:
             parts.append(f"{stats.missing_h3} H3")
         reasons.append(
             f"Localized file is missing headings present in source ({', '.join(parts)})"
         )
-
-    if h2_as_h3_note:
-        reasons.append(h2_as_h3_note)
 
     if stats.missing_code_blocks:
         reasons.append(
@@ -585,7 +554,7 @@ def build_reasons(
 
     if stats.missing_anchors:
         only_anchor = (
-            eff_h2 == 0 and stats.missing_h3 == 0
+            stats.missing_h2 == 0 and stats.missing_h3 == 0
             and stats.missing_code_blocks == 0
             and stats.missing_new_versions == 0
             and not (indset & _LENGTH_GAP_INDICATORS)
