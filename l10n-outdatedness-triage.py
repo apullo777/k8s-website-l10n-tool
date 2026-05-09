@@ -17,7 +17,11 @@
 """Localization outdatedness triage helper.
 
 Compares each localized Markdown page against its English source and
-classifies it as `Likely outdated`, `Maybe outdated`, or `No signal`.
+classifies it as `Strong signal`, `Moderate signal`, or `No signal`.
+
+New locale note:
+    Locales under content/ are auto-discovered when scanning all locales.
+    Add script calibration only if review shows repeated locale-specific false alarms.
 
 Usage:
     # scan all non-en locales (default)
@@ -97,8 +101,8 @@ _ORPHAN_REASON = (
     "upstream or is intentionally locale-specific."
 )
 
-STATUS_LIKELY_OUTDATED = "Likely outdated"
-STATUS_MAYBE_OUTDATED = "Maybe outdated"
+STATUS_STRONG_SIGNAL = "Strong signal"
+STATUS_MODERATE_SIGNAL = "Moderate signal"
 STATUS_NO_SIGNAL = "No signal"
 
 # Cutoffs for when missing items count as a "strong" outdatedness signal;
@@ -136,8 +140,8 @@ _NON_LENGTH_INDICATORS: FrozenSet[str] = frozenset({
 })
 
 _STATUS_SORT_KEY = {
-    STATUS_LIKELY_OUTDATED: 0,
-    STATUS_MAYBE_OUTDATED: 1,
+    STATUS_STRONG_SIGNAL: 0,
+    STATUS_MODERATE_SIGNAL: 1,
     STATUS_NO_SIGNAL: 2,
 }
 
@@ -371,35 +375,6 @@ def _should_ignore_length_gap(
             return True
     return False
 
-# --- Locale-specific false-alarm adjustments ---
-#
-# These helpers suppress or downgrade indicators that have empirically produced
-# false alarms for specific locale/content patterns. Keeping them together makes
-# it easier to review where locale-specific behavior affects triage.
-#
-# Examples:
-# - CJK translations can use fewer/denser lines than EN without being outdated.
-# - Some Latin-script translations preserve full body content in fewer lines.
-# - Some locales translate section anchors instead of preserving EN anchor IDs.
-#
-# `_should_ignore_length_gap` above handles length-gap false alarms before
-# indicators are emitted; the helper below handles later anchor adjustments.
-
-def _is_expected_anchor_loss_by_locale(
-    non_length_gap_supporting: Set[str], locale: str,
-    l10n_to_en_body_word_ratio: float, missing_anchors: int,
-) -> bool:
-    # Latin: some locales translate anchor IDs instead of preserving the
-    # source identifier — looks compact with a small anchor mismatch but
-    # carries full word volume. Without this guard, rule 4 falsely promotes them.
-    return (
-        locale in _LATIN_COMPACTNESS_LOCALES
-        and l10n_to_en_body_word_ratio >= _LATIN_BODY_RATIO_MIN
-        and missing_anchors <= 2
-        and len(non_length_gap_supporting) >= 1
-        and all(s == "moderate_anchor_loss" for s in non_length_gap_supporting)
-    )
-
 # --- Indicator detection ---
 
 def _has_length_gap_support(stats: FileStats) -> bool:
@@ -468,20 +443,35 @@ def build_indicators(
 
 # --- Status classification ---
 
+def _is_expected_translated_anchor_loss(
+    non_length_gap_supporting: Set[str], locale: str,
+    l10n_to_en_body_word_ratio: float, missing_anchors: int,
+) -> bool:
+    # Latin: some locales translate anchor IDs instead of preserving the
+    # source identifier — looks compact with a small anchor mismatch but
+    # carries full word volume. Without this guard, rule 4 falsely promotes them.
+    return (
+        locale in _LATIN_COMPACTNESS_LOCALES
+        and l10n_to_en_body_word_ratio >= _LATIN_BODY_RATIO_MIN
+        and missing_anchors <= 2
+        and len(non_length_gap_supporting) >= 1
+        and all(s == "moderate_anchor_loss" for s in non_length_gap_supporting)
+    )
+
 def classify_status(
     indicators: List[str], *,
     locale: str, l10n_to_en_body_word_ratio: float, missing_anchors: int,
 ) -> str:
     """Classification rules, in order:
 
-    1. `empty_stub` or `severe_api_and_feature_mismatch` → Likely Outdated.
-    2. ≥2 strong → Likely Outdated.
-    3. ≥1 strong + ≥1 supporting → Likely Outdated.
-    4. `large_length_gap` + ≥1 non-length-gap supporting → Likely Outdated
+    1. `empty_stub` or `severe_api_and_feature_mismatch` → Strong signal.
+    2. ≥2 strong → Strong signal.
+    3. ≥1 strong + ≥1 supporting → Strong signal.
+    4. `large_length_gap` + ≥1 non-length-gap supporting → Strong signal
        (guarded against the Latin translated-anchor false-alarm).
-    5. ≥3 supporting → Maybe outdated.
-    6. ≥1 strong or ≥1 supporting → Maybe outdated.
-    7. `small_length_gap` → Maybe outdated.
+    5. ≥3 supporting → Moderate signal.
+    6. ≥1 strong or ≥1 supporting → Moderate signal.
+    7. `small_length_gap` → Moderate signal.
     8. Otherwise → No signal.
     """
     if not indicators:
@@ -492,25 +482,25 @@ def classify_status(
     supporting = indset & _SUPPORTING_INDICATORS
 
     if "empty_stub" in indset:
-        return STATUS_LIKELY_OUTDATED
+        return STATUS_STRONG_SIGNAL
     if "severe_api_and_feature_mismatch" in indset:
-        return STATUS_LIKELY_OUTDATED
+        return STATUS_STRONG_SIGNAL
     if len(strong) >= 2:
-        return STATUS_LIKELY_OUTDATED
+        return STATUS_STRONG_SIGNAL
     if strong and supporting:
-        return STATUS_LIKELY_OUTDATED
+        return STATUS_STRONG_SIGNAL
     if "large_length_gap" in indset:
         non_length_gap = supporting - _LENGTH_GAP_INDICATORS
-        if non_length_gap and not _is_expected_anchor_loss_by_locale(
+        if non_length_gap and not _is_expected_translated_anchor_loss(
                 non_length_gap, locale,
                 l10n_to_en_body_word_ratio, missing_anchors):
-            return STATUS_LIKELY_OUTDATED
+            return STATUS_STRONG_SIGNAL
     if len(supporting) >= 3:
-        return STATUS_LIKELY_OUTDATED
+        return STATUS_MODERATE_SIGNAL
     if strong or supporting:
-        return STATUS_MAYBE_OUTDATED
+        return STATUS_MODERATE_SIGNAL
     if "small_length_gap" in indset:
-        return STATUS_MAYBE_OUTDATED
+        return STATUS_MODERATE_SIGNAL
     return STATUS_NO_SIGNAL
 
 # --- Reason generation ---
@@ -698,8 +688,8 @@ def count_files_by_status(
 ) -> Tuple[int, int, int]:
     c = Counter(fr.status for fr in evaluated)
     return (
-        c[STATUS_LIKELY_OUTDATED],
-        c[STATUS_MAYBE_OUTDATED],
+        c[STATUS_STRONG_SIGNAL],
+        c[STATUS_MODERATE_SIGNAL],
         c[STATUS_NO_SIGNAL],
     )
 
@@ -714,8 +704,8 @@ def _build_report_disclaimer() -> List[str]:
         "**Triage category meanings:**",
         "",
         "- `Orphan`: no matching English source; verify whether this is expected.",
-        "- `Likely outdated`: high-confidence signal; likely needs review or update",
-        "- `Maybe outdated`: medium-confidence signal; verify manually.",
+        "- `Strong signal`: high-confidence signal; likely needs review or update",
+        "- `Moderate signal`: medium-confidence signal; verify manually.",
         "- `No signal`: no signal found; lowest priority, not a guarantee that the translation is current.",
         "",
     ]
@@ -731,9 +721,9 @@ def build_locale_report(
     branch: str = "main",
     output_dir: str = ".",
 ) -> str:
-    hi, poss, curr = count_files_by_status(evaluated)
+    strong, moderate, no_signal = count_files_by_status(evaluated)
     total = len(evaluated) + len(orphans)
-    w = max(len(STATUS_LIKELY_OUTDATED), len(STATUS_MAYBE_OUTDATED),
+    w = max(len(STATUS_STRONG_SIGNAL), len(STATUS_MODERATE_SIGNAL),
             len(STATUS_NO_SIGNAL), len("Evaluated"), len("Orphan"))
     lines: List[str] = [
         f"## Localization triage: `{locale}`",
@@ -748,10 +738,10 @@ def build_locale_report(
         "| Triage category | Count |",
         "|---|---:|",
         f"| {'Evaluated':<{w}} | {total} |",
-        f"| {STATUS_NO_SIGNAL:<{w}} | {curr} |",
+        f"| {STATUS_NO_SIGNAL:<{w}} | {no_signal} |",
         f"| {'Orphan':<{w}} | {len(orphans)} |",
-        f"| {STATUS_LIKELY_OUTDATED:<{w}} | {hi} |",
-        f"| {STATUS_MAYBE_OUTDATED:<{w}} | {poss} |",
+        f"| {STATUS_STRONG_SIGNAL:<{w}} | {strong} |",
+        f"| {STATUS_MODERATE_SIGNAL:<{w}} | {moderate} |",
         "",
     ])
 
@@ -767,8 +757,8 @@ def build_locale_report(
         lines.append("")
 
     by_status: Dict[str, List[FileReport]] = {
-        STATUS_LIKELY_OUTDATED: [],
-        STATUS_MAYBE_OUTDATED: [],
+        STATUS_STRONG_SIGNAL: [],
+        STATUS_MODERATE_SIGNAL: [],
         STATUS_NO_SIGNAL: [],
     }
     for fr in evaluated:
@@ -789,7 +779,7 @@ def build_locale_report(
     else:
         lines.extend(["_None_", ""])
 
-    for key in (STATUS_LIKELY_OUTDATED, STATUS_MAYBE_OUTDATED):
+    for key in (STATUS_STRONG_SIGNAL, STATUS_MODERATE_SIGNAL):
         items = by_status[key]
         lines.extend([f"### {key} ({len(items)})", ""])
         if not items:
@@ -823,16 +813,16 @@ def build_index_report(
         "",
         f"Generated: {date}",
         "",
-        f"| Locale | Report | Evaluated | {STATUS_NO_SIGNAL} | Orphan | {STATUS_LIKELY_OUTDATED} | {STATUS_MAYBE_OUTDATED} |",
+        f"| Locale | Report | Evaluated | {STATUS_NO_SIGNAL} | Orphan | {STATUS_STRONG_SIGNAL} | {STATUS_MODERATE_SIGNAL} |",
         "|---|---|---:|---:|---:|---:|---:|",
     ]
     for locale, evaluated, orphans in results:
-        hi, poss, curr = count_files_by_status(evaluated)
+        strong, moderate, no_signal = count_files_by_status(evaluated)
         total = len(evaluated) + len(orphans)
         fname = f"l10n-status-{locale}.md"
         lines.append(
             f"| `{locale}` | [{fname}]({fname}) | {total} |"
-            f" {curr} | {len(orphans)} | {hi} | {poss} |"
+            f" {no_signal} | {len(orphans)} | {strong} | {moderate} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -941,11 +931,11 @@ def main() -> None:
                 link_mode=args.link, branch=args.branch,
                 output_dir=abs_output_dir,
             ))
-        hi, poss, curr = count_files_by_status(evaluated)
+        strong, moderate, no_signal = count_files_by_status(evaluated)
         print(
             f"Wrote {out_path}  "
-            f"({len(orphans)} orphans, {hi} {STATUS_LIKELY_OUTDATED}, "
-            f"{poss} {STATUS_MAYBE_OUTDATED}, {curr} {STATUS_NO_SIGNAL})",
+            f"({len(orphans)} orphans, {strong} {STATUS_STRONG_SIGNAL}, "
+            f"{moderate} {STATUS_MODERATE_SIGNAL}, {no_signal} {STATUS_NO_SIGNAL})",
             file=sys.stderr,
         )
 
