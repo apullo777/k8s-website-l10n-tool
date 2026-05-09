@@ -1,9 +1,27 @@
 #!/usr/bin/env python3
 
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Localization outdatedness triage helper.
 
 Compares each localized Markdown page against its English source and
-classifies it as `Likely outdated`, `Maybe outdated`, or `No signal`.
+classifies it as `Strong signal`, `Moderate signal`, or `No signal`.
+
+New locale note:
+    Locales under content/ are auto-discovered when scanning all locales.
+    Add script calibration only if review shows repeated locale-specific false alarms.
 
 Usage:
     # scan all non-en locales (default)
@@ -83,15 +101,17 @@ _ORPHAN_REASON = (
     "upstream or is intentionally locale-specific."
 )
 
-STATUS_HIGHLY_OUTDATED = "Outdated"
-STATUS_POSSIBLY_OUTDATED = "Possibly outdated"
-STATUS_CURRENT = "Up to date"
+STATUS_STRONG_SIGNAL = "Strong signal"
+STATUS_MODERATE_SIGNAL = "Moderate signal"
+STATUS_NO_SIGNAL = "No signal"
 
-_STRONG_H2_THRESHOLD = 2
-_STRONG_H3_WITH_H2_THRESHOLD = 5
-_STRONG_CODE_THRESHOLD = 3
-_STRONG_ANCHOR_THRESHOLD = 5
-_STRONG_VERSION_THRESHOLD = 3
+# Cutoffs for when missing items count as a "strong" outdatedness signal;
+# see classify_status() for how strong signals affect the final status.
+_STRONG_H2_THRESHOLD = 2              # missing H2 headings
+_STRONG_H3_WITH_H2_THRESHOLD = 5      # missing H3s, plus at least one missing H2
+_STRONG_CODE_THRESHOLD = 3            # missing code blocks
+_STRONG_ANCHOR_THRESHOLD = 5          # missing section anchors
+_STRONG_VERSION_THRESHOLD = 3         # missing newer Kubernetes version refs
 
 _STRONG_INDICATORS: FrozenSet[str] = frozenset({
     "empty_stub", "severe_heading_loss", "severe_code_loss",
@@ -120,9 +140,9 @@ _NON_LENGTH_INDICATORS: FrozenSet[str] = frozenset({
 })
 
 _STATUS_SORT_KEY = {
-    STATUS_HIGHLY_OUTDATED: 0,
-    STATUS_POSSIBLY_OUTDATED: 1,
-    STATUS_CURRENT: 2,
+    STATUS_STRONG_SIGNAL: 0,
+    STATUS_MODERATE_SIGNAL: 1,
+    STATUS_NO_SIGNAL: 2,
 }
 
 # --- Data classes ---
@@ -355,48 +375,14 @@ def _should_ignore_length_gap(
             return True
     return False
 
-# --- Locale-specific adjustments ---
-
-def _resolve_effective_heading_loss(
-    stats: FileStats, en: ParsedFile, l10n: ParsedFile, locale: str,
-) -> Tuple[int, str]:
-    """Missing H2 count after locale-specific adjustments."""
-    # zh-cn bilingual files sometimes render source H2 as H3 (source heading
-    # kept in a comment). When H3 surplus covers the H2 deficit, count as 1
-    # missing H2; predicates guard against genuine small H2 deficits.
-    if (locale == "zh-cn"
-            and stats.missing_h2 >= 3
-            and l10n.h3 > en.h3
-            and (l10n.h3 - en.h3) >= stats.missing_h2
-            and stats.l10n_to_en_line_ratio >= 0.70
-            and stats.missing_code_blocks <= 1):
-        effective = min(1, stats.missing_h2)
-        adjusted = stats.missing_h2 - effective
-        note = (
-            f"Possible heading-level mismatch: {adjusted} of {stats.missing_h2} "
-            f"apparent missing H2(s) may have been translated as H3(s) in the "
-            f"zh-cn file (zh-cn has {l10n.h3 - en.h3} more H3s than source) — "
-            "counted as 1 H2; verify manually"
-        )
-        return effective, note
-    return stats.missing_h2, ""
-
-def _is_expected_anchor_loss_by_locale(
-    non_length_gap_supporting: Set[str], locale: str,
-    l10n_to_en_body_word_ratio: float, missing_anchors: int,
-) -> bool:
-    # Latin: some locales translate anchor IDs instead of preserving the
-    # source identifier — looks compact with a small anchor mismatch but
-    # carries full word volume. Without this guard, rule 4 falsely promotes them.
-    return (
-        locale in _LATIN_COMPACTNESS_LOCALES
-        and l10n_to_en_body_word_ratio >= _LATIN_BODY_RATIO_MIN
-        and missing_anchors <= 2
-        and len(non_length_gap_supporting) >= 1
-        and all(s == "moderate_anchor_loss" for s in non_length_gap_supporting)
-    )
-
 # --- Indicator detection ---
+
+def _has_length_gap_support(stats: FileStats) -> bool:
+    """Return whether non-length indicators support a length-gap finding."""
+    return (
+        stats.missing_h2 > 0 or stats.missing_h3 > 0
+        or stats.missing_code_blocks > 0 or stats.missing_new_versions > 0
+    )
 
 def build_indicators(
     stats: FileStats, en: ParsedFile, l10n: ParsedFile, locale: str,
@@ -412,12 +398,7 @@ def build_indicators(
     else:
         level = _LENGTH_GAP_NONE
 
-    eff_h2, _ = _resolve_effective_heading_loss(stats, en, l10n, locale)
-
-    has_support = (
-        eff_h2 > 0 or stats.missing_h3 > 0
-        or stats.missing_code_blocks > 0 or stats.missing_new_versions > 0
-    )
+    has_support = _has_length_gap_support(stats)
 
     if _should_ignore_length_gap(stats, en, l10n, locale, level, has_support):
         level = _LENGTH_GAP_NONE
@@ -427,10 +408,10 @@ def build_indicators(
     elif level == _LENGTH_GAP_MODERATE:
         indicators.append("moderate_length_gap")
 
-    if (eff_h2 >= _STRONG_H2_THRESHOLD
-            or (eff_h2 >= 1 and stats.missing_h3 >= _STRONG_H3_WITH_H2_THRESHOLD)):
+    if (stats.missing_h2 >= _STRONG_H2_THRESHOLD
+            or (stats.missing_h2 >= 1 and stats.missing_h3 >= _STRONG_H3_WITH_H2_THRESHOLD)):
         indicators.append("severe_heading_loss")
-    elif eff_h2 >= 1 or stats.missing_h3 >= 2:
+    elif stats.missing_h2 >= 1 or stats.missing_h3 >= 2:
         indicators.append("moderate_heading_loss")
 
     if stats.missing_code_blocks >= _STRONG_CODE_THRESHOLD:
@@ -462,50 +443,65 @@ def build_indicators(
 
 # --- Status classification ---
 
+def _is_expected_translated_anchor_loss(
+    non_length_gap_supporting: Set[str], locale: str,
+    l10n_to_en_body_word_ratio: float, missing_anchors: int,
+) -> bool:
+    # Latin: some locales translate anchor IDs instead of preserving the
+    # source identifier — looks compact with a small anchor mismatch but
+    # carries full word volume. Without this guard, rule 4 falsely promotes them.
+    return (
+        locale in _LATIN_COMPACTNESS_LOCALES
+        and l10n_to_en_body_word_ratio >= _LATIN_BODY_RATIO_MIN
+        and missing_anchors <= 2
+        and len(non_length_gap_supporting) >= 1
+        and all(s == "moderate_anchor_loss" for s in non_length_gap_supporting)
+    )
+
 def classify_status(
     indicators: List[str], *,
     locale: str, l10n_to_en_body_word_ratio: float, missing_anchors: int,
 ) -> str:
     """Classification rules, in order:
 
-    1. `empty_stub` or `severe_api_and_feature_mismatch` → Outdated.
-    2. ≥2 strong → Outdated.
-    3. ≥1 strong + ≥1 supporting → Outdated.
-    4. `large_length_gap` + ≥1 non-length-gap supporting → Outdated
+    1. `empty_stub` or `severe_api_and_feature_mismatch` → Strong signal.
+    2. ≥2 strong → Strong signal.
+    3. ≥1 strong + ≥1 supporting → Strong signal.
+    4. `large_length_gap` + ≥1 non-length-gap supporting → Strong signal
        (guarded against the Latin translated-anchor false-alarm).
-    5. ≥3 supporting → Outdated.
-    6. ≥1 strong or ≥1 supporting → Possibly outdated.
-    7. `small_length_gap` → Possibly outdated.
-    8. Otherwise → Up to date.
+    5. ≥3 supporting → Moderate signal.
+    6. ≥1 strong or ≥1 supporting → Moderate signal.
+    7. `small_length_gap` → Moderate signal.
+    8. Otherwise → No signal.
     """
     if not indicators:
-        return STATUS_CURRENT
+        return STATUS_NO_SIGNAL
 
     indset = set(indicators)
     strong = indset & _STRONG_INDICATORS
     supporting = indset & _SUPPORTING_INDICATORS
 
     if "empty_stub" in indset:
-        return STATUS_HIGHLY_OUTDATED
+        return STATUS_STRONG_SIGNAL
     if "severe_api_and_feature_mismatch" in indset:
-        return STATUS_HIGHLY_OUTDATED
+        return STATUS_STRONG_SIGNAL
     if len(strong) >= 2:
-        return STATUS_HIGHLY_OUTDATED
+        return STATUS_STRONG_SIGNAL
     if strong and supporting:
-        return STATUS_HIGHLY_OUTDATED
+        return STATUS_STRONG_SIGNAL
     if "large_length_gap" in indset:
         non_length_gap = supporting - _LENGTH_GAP_INDICATORS
-        if non_length_gap and not _is_expected_anchor_loss_by_locale(
+        if non_length_gap and not _is_expected_translated_anchor_loss(
                 non_length_gap, locale,
                 l10n_to_en_body_word_ratio, missing_anchors):
-            return STATUS_HIGHLY_OUTDATED
+            return STATUS_STRONG_SIGNAL
     if len(supporting) >= 3:
-        return STATUS_HIGHLY_OUTDATED
+        return STATUS_MODERATE_SIGNAL
     if strong or supporting:
-        return STATUS_POSSIBLY_OUTDATED
+        return STATUS_MODERATE_SIGNAL
     if "small_length_gap" in indset:
-        return STATUS_POSSIBLY_OUTDATED
-    return STATUS_CURRENT
+        return STATUS_MODERATE_SIGNAL
+    return STATUS_NO_SIGNAL
 
 # --- Reason generation ---
 
@@ -530,19 +526,15 @@ def build_reasons(
     elif "small_length_gap" in indset:
         reasons.append(_build_length_gap_reason(_LENGTH_GAP_SMALL, stats.l10n_to_en_line_ratio))
 
-    eff_h2, h2_as_h3_note = _resolve_effective_heading_loss(stats, en, l10n, locale)
-    if eff_h2 > 0 or stats.missing_h3 > 0:
+    if stats.missing_h2 > 0 or stats.missing_h3 > 0:
         parts = []
-        if eff_h2:
-            parts.append(f"{eff_h2} H2")
+        if stats.missing_h2:
+            parts.append(f"{stats.missing_h2} H2")
         if stats.missing_h3:
             parts.append(f"{stats.missing_h3} H3")
         reasons.append(
             f"Localized file is missing headings present in source ({', '.join(parts)})"
         )
-
-    if h2_as_h3_note:
-        reasons.append(h2_as_h3_note)
 
     if stats.missing_code_blocks:
         reasons.append(
@@ -552,7 +544,7 @@ def build_reasons(
 
     if stats.missing_anchors:
         only_anchor = (
-            eff_h2 == 0 and stats.missing_h3 == 0
+            stats.missing_h2 == 0 and stats.missing_h3 == 0
             and stats.missing_code_blocks == 0
             and stats.missing_new_versions == 0
             and not (indset & _LENGTH_GAP_INDICATORS)
@@ -596,7 +588,7 @@ def analyze_file_pair(
     )
     reasons = (
         build_reasons(stats, en, l10n, locale, indicators)
-        if status != STATUS_CURRENT else []
+        if status != STATUS_NO_SIGNAL else []
     )
     return FileReport(
         localized_path=l10n_path,
@@ -696,10 +688,27 @@ def count_files_by_status(
 ) -> Tuple[int, int, int]:
     c = Counter(fr.status for fr in evaluated)
     return (
-        c[STATUS_HIGHLY_OUTDATED],
-        c[STATUS_POSSIBLY_OUTDATED],
-        c[STATUS_CURRENT],
+        c[STATUS_STRONG_SIGNAL],
+        c[STATUS_MODERATE_SIGNAL],
+        c[STATUS_NO_SIGNAL],
     )
+
+def _build_report_disclaimer() -> List[str]:
+    """Triage disclaimer + status-meaning block included in every per-locale report."""
+    return [
+        "> This report is a signal-based triage aid, not a final localization review.",
+        "> It checks page structure and outdatedness indicators such as headings, code blocks,",
+        "> anchors, Kubernetes versions, and API / feature-state values. It does not",
+        "> check translation meaning or quality. Please manually verify flagged files.",
+        "",
+        "**Triage category meanings:**",
+        "",
+        "- `Orphan`: no matching English source; verify whether this is expected.",
+        "- `Strong signal`: high-confidence signal; likely needs review or update",
+        "- `Moderate signal`: medium-confidence signal; verify manually.",
+        "- `No signal`: no signal found; lowest priority, not a guarantee that the translation is current.",
+        "",
+    ]
 
 def build_locale_report(
     locale: str,
@@ -712,31 +721,34 @@ def build_locale_report(
     branch: str = "main",
     output_dir: str = ".",
 ) -> str:
-    hi, poss, curr = count_files_by_status(evaluated)
+    strong, moderate, no_signal = count_files_by_status(evaluated)
     total = len(evaluated) + len(orphans)
-    w = max(len(STATUS_HIGHLY_OUTDATED), len(STATUS_POSSIBLY_OUTDATED),
-            len(STATUS_CURRENT), len("Evaluated"), len("Orphan"))
+    w = max(len(STATUS_STRONG_SIGNAL), len(STATUS_MODERATE_SIGNAL),
+            len(STATUS_NO_SIGNAL), len("Evaluated"), len("Orphan"))
     lines: List[str] = [
-        f"## Localization status: `{locale}`",
+        f"## Localization triage: `{locale}`",
         "",
         f"Generated: {date}  ",
-        "Method: content-based indicators only  ",
+        "Method: checks page structure and outdatedness indicators  ",
         "Script: `l10n-outdatedness-triage.py`",
         "",
-        "| Status | Count |",
+    ]
+    lines.extend(_build_report_disclaimer())
+    lines.extend([
+        "| Triage category | Count |",
         "|---|---:|",
         f"| {'Evaluated':<{w}} | {total} |",
-        f"| {STATUS_CURRENT:<{w}} | {curr} |",
+        f"| {STATUS_NO_SIGNAL:<{w}} | {no_signal} |",
         f"| {'Orphan':<{w}} | {len(orphans)} |",
-        f"| {STATUS_HIGHLY_OUTDATED:<{w}} | {hi} |",
-        f"| {STATUS_POSSIBLY_OUTDATED:<{w}} | {poss} |",
+        f"| {STATUS_STRONG_SIGNAL:<{w}} | {strong} |",
+        f"| {STATUS_MODERATE_SIGNAL:<{w}} | {moderate} |",
         "",
-    ]
+    ])
 
     area_counts: Counter = Counter(
         _extract_doc_area(fr.localized_path, locale)
         for fr in evaluated
-        if fr.status != STATUS_CURRENT
+        if fr.status != STATUS_NO_SIGNAL
     )
     if area_counts:
         lines.extend(["**Top affected areas (flagged files):**", ""])
@@ -745,9 +757,9 @@ def build_locale_report(
         lines.append("")
 
     by_status: Dict[str, List[FileReport]] = {
-        STATUS_HIGHLY_OUTDATED: [],
-        STATUS_POSSIBLY_OUTDATED: [],
-        STATUS_CURRENT: [],
+        STATUS_STRONG_SIGNAL: [],
+        STATUS_MODERATE_SIGNAL: [],
+        STATUS_NO_SIGNAL: [],
     }
     for fr in evaluated:
         by_status[fr.status].append(fr)
@@ -767,7 +779,7 @@ def build_locale_report(
     else:
         lines.extend(["_None_", ""])
 
-    for key in (STATUS_HIGHLY_OUTDATED, STATUS_POSSIBLY_OUTDATED):
+    for key in (STATUS_STRONG_SIGNAL, STATUS_MODERATE_SIGNAL):
         items = by_status[key]
         lines.extend([f"### {key} ({len(items)})", ""])
         if not items:
@@ -780,7 +792,7 @@ def build_locale_report(
                 if link_mode else ""
             )
             if detailed and fr.reasons:
-                lines.append(f"**`{path}`** — status: {fr.status}{links}")
+                lines.append(f"**`{path}`** — triage: {fr.status}{links}")
                 lines.extend(f"- {r}" for r in fr.reasons)
                 if fr.indicators:
                     lines.append(f"- Indicators: {', '.join(fr.indicators)}")
@@ -797,20 +809,20 @@ def build_index_report(
     results: List[Tuple[str, List[FileReport], List[str]]], date: str,
 ) -> str:
     lines = [
-        "## Localization status index",
+        "## Localization triage index",
         "",
         f"Generated: {date}",
         "",
-        f"| Locale | Report | Evaluated | {STATUS_CURRENT} | Orphan | {STATUS_HIGHLY_OUTDATED} | {STATUS_POSSIBLY_OUTDATED} |",
+        f"| Locale | Report | Evaluated | {STATUS_NO_SIGNAL} | Orphan | {STATUS_STRONG_SIGNAL} | {STATUS_MODERATE_SIGNAL} |",
         "|---|---|---:|---:|---:|---:|---:|",
     ]
     for locale, evaluated, orphans in results:
-        hi, poss, curr = count_files_by_status(evaluated)
+        strong, moderate, no_signal = count_files_by_status(evaluated)
         total = len(evaluated) + len(orphans)
         fname = f"l10n-status-{locale}.md"
         lines.append(
             f"| `{locale}` | [{fname}]({fname}) | {total} |"
-            f" {curr} | {len(orphans)} | {hi} | {poss} |"
+            f" {no_signal} | {len(orphans)} | {strong} | {moderate} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -839,8 +851,8 @@ def _resolve_locales(args: argparse.Namespace, repo_root: str) -> List[str]:
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Localization outdatedness detector. Classifies "
-            "localized files by status using content-based indicators "
+            "Localization outdatedness triage helper. Classifies "
+            "localized files by status using page structure and outdatedness indicators "
             "and emits compact reports; orphan localized docs are "
             "listed in a separate section."
         ),
@@ -919,11 +931,11 @@ def main() -> None:
                 link_mode=args.link, branch=args.branch,
                 output_dir=abs_output_dir,
             ))
-        hi, poss, curr = count_files_by_status(evaluated)
+        strong, moderate, no_signal = count_files_by_status(evaluated)
         print(
             f"Wrote {out_path}  "
-            f"({len(orphans)} orphans, {hi} {STATUS_HIGHLY_OUTDATED}, "
-            f"{poss} {STATUS_POSSIBLY_OUTDATED}, {curr} {STATUS_CURRENT})",
+            f"({len(orphans)} orphans, {strong} {STATUS_STRONG_SIGNAL}, "
+            f"{moderate} {STATUS_MODERATE_SIGNAL}, {no_signal} {STATUS_NO_SIGNAL})",
             file=sys.stderr,
         )
 
